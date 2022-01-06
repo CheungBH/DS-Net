@@ -190,6 +190,7 @@ def validate_slim(model, loader, loss_fn, args, log_suffix='', model_mode='large
     prec1_m = AverageMeter()
     prec5_m = AverageMeter()
     flops_m = AverageMeter()
+    inference_logger = AverageMeter()
 
     model.eval()
     model.apply(lambda m: add_mac_hooks(m))
@@ -212,7 +213,10 @@ def validate_slim(model, loader, loss_fn, args, log_suffix='', model_mode='large
                 input = input.cuda()
                 target = target.cuda()
 
+            inference_begin = time.time()
             output = model(input)
+            inference_logger.update(time.time() - inference_begin, 1)
+
             running_flops = add_flops(model)
             if isinstance(running_flops, torch.Tensor):
                 running_flops = running_flops.float().mean().cuda()
@@ -265,6 +269,8 @@ def validate_slim(model, loader, loss_fn, args, log_suffix='', model_mode='large
                         top1=prec1_m, top5=prec5_m))
 
     metrics = OrderedDict(
-        [('loss', losses_m.avg), ('prec1', prec1_m.avg), ('prec5', prec5_m.avg), ('flops', flops_m.avg)])
+        [('loss', losses_m.avg), ('prec1', prec1_m.avg), ('prec5', prec5_m.avg), ('flops', flops_m.avg),
+         ("time", round((time.time() - inference_begin), 4))])
+    print("average second per image: {}".format(round(inference_logger.avg, 4)))
 
     return metrics

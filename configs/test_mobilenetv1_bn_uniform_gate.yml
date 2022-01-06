@@ -1,6 +1,6 @@
 pin_mem: True
 model: slimmable_mbnet_v1_bn_uniform
-num_choice: 14
+num_choice: 4
 
 sync_bn: false
 opt: sgd
@@ -26,7 +26,7 @@ validation_batch_size_multiplier: 4
 warmup_epochs: 0
 workers: 10
 pretrained: false
-resume: 'output/train-slimmable-slimmable_mbnet_v1_bn_uniform/20211230-142824-slimmable_mbnet_v1_bn_uniform/model_best.pth.tar' # Your supernet checkpoint
+resume: '' # Your supernet checkpoint after reset bn
 no_resume_opt: true
 start_epoch: 0
 
@@ -35,6 +35,7 @@ test_mode: true
 
 slim_train: true
 ieb: true
-gate_train: false
+gate_train: true
+start_chn_idx: 0  # start index of the routing space. Only useful if gate_train is set to true
 dist_bn: reduce
-reset_bn: true
+reset_bn: false

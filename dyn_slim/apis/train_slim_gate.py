@@ -42,6 +42,8 @@ def train_epoch_slim_gate(
     flops_loss_m = AverageMeter()
     acc_gate_m_l = [AverageMeter() for i in range(num_gate)]
     gate_loss_m_l = [AverageMeter() for i in range(num_gate)]
+    inference_logger = AverageMeter()
+
     model.train()
     for n, m in model.named_modules():  # Freeze bn
         if isinstance(m, nn.BatchNorm2d) or isinstance(m, DSBatchNorm2d):
@@ -78,7 +80,10 @@ def train_epoch_slim_gate(
                            for idx in range(correct_s[0].size(0))]
             gate_target = torch.stack(gate_target).squeeze(-1).cuda()
         # =============
+        inference_begin = time.time()
         set_model_mode(model, 'dynamic')
+        inference_logger.update(time.time() - inference_begin, 1)
+
         output = model(input)
 
         if hasattr(model, 'module'):
@@ -202,6 +207,7 @@ def train_epoch_slim_gate(
 
     if hasattr(optimizer, 'sync_lookahead'):
         optimizer.sync_lookahead()
+    print("average second per image: {}".format(round(inference_logger.avg, 4)))
 
     return OrderedDict([('loss', losses_m.avg)])
 
@@ -217,6 +223,7 @@ def validate_gate(model, loader, loss_fn, args, log_suffix=''):
     prec1_m = AverageMeter()
     prec5_m = AverageMeter()
     flops_m = AverageMeter()
+    inference_logger = AverageMeter()
     acc_gate_m_l = [AverageMeter() for i in range(num_gate)]
     model.eval()
 
@@ -247,8 +254,11 @@ def validate_gate(model, loader, loss_fn, args, log_suffix=''):
                            for idx in range(correct_s[0].size(0))]
             gate_target = torch.stack(gate_target).squeeze(-1).cuda()
         # =============
+
         set_model_mode(model, 'dynamic')
+        inference_begin = time.time()
         output = model(input)
+        inference_logger.update(time.time() - inference_begin, 1)
 
         if hasattr(model, 'module'):
             model_ = model.module
@@ -320,6 +330,7 @@ def validate_gate(model, loader, loss_fn, args, log_suffix=''):
         # end for
     metrics = OrderedDict(
         [('loss', losses_m.avg), ('prec1', prec1_m.avg), ('prec5', prec5_m.avg), ('flops', flops_m.avg)])
+    print("average second per image: {}".format(round(inference_logger.avg, 4)))
 
     return metrics
 

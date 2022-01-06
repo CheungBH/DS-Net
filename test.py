@@ -19,7 +19,10 @@ import logging
 import random
 from collections import OrderedDict
 from datetime import datetime
-
+from dyn_slim.models.dyn_slim_blocks import MultiHeadGate
+from dyn_slim.models.dyn_slim_ops import DSBatchNorm2d
+from dyn_slim.utils import add_flops, accuracy
+from timm.utils import *
 import numpy as np
 import yaml
 from timm.utils import get_outdir, distribute_bn, update_summary
@@ -28,8 +31,9 @@ from timm.models import create_model, convert_splitbn_model
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy, JsdCrossEntropy
 from timm.optim import create_optimizer
 from timm.scheduler import create_scheduler
+import time
 
-from dyn_slim.apis.train_slim_gate import validate_gate
+from dyn_slim.apis.train_slim_gate import *
 from dyn_slim.utils import model_profiling, setup_default_logging, CheckpointSaver, ModelEma, resume_checkpoint
 from dyn_slim.apis import train_epoch_slim, validate_slim, train_epoch_slim_gate
 import os
@@ -215,6 +219,193 @@ def _parse_args():
     # Cache the args as a text string to save them in the output dir later
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
     return args, args_text
+
+
+@torch.no_grad()
+def validate_gate(model, loader, loss_fn, args, log_suffix=''):
+    start_chn_idx = args.start_chn_idx
+    num_gate = 1
+
+    batch_time_m = AverageMeter()
+    data_time_m = AverageMeter()
+    losses_m = AverageMeter()
+    prec1_m = AverageMeter()
+    prec5_m = AverageMeter()
+    flops_m = AverageMeter()
+    acc_gate_m_l = [AverageMeter() for i in range(num_gate)]
+    model.eval()
+    inference_begin = time.time()
+
+    for n, m in model.named_modules():
+        if len(getattr(m, 'in_channels_list', [])) > 4:
+            m.in_channels_list = m.in_channels_list[start_chn_idx:4]
+            m.in_channels_list_tensor = torch.from_numpy(
+                np.array(m.in_channels_list)).float().cuda()
+        if len(getattr(m, 'out_channels_list', [])) > 4:
+            m.out_channels_list = m.out_channels_list[start_chn_idx:4]
+            m.out_channels_list_tensor = torch.from_numpy(
+                np.array(m.out_channels_list)).float().cuda()
+
+    end = time.time()
+    last_idx = len(loader) - 1
+    model.apply(lambda m: add_mac_hooks(m))
+    set_model_mode(model, 'dynamic')
+    for batch_idx, (input, target) in enumerate(loader):
+        last_batch = batch_idx == last_idx
+        data_time_m.update(time.time() - end)
+        if not args.prefetcher:
+            input, target = input.cuda(), target.cuda()
+
+        output = model(input)
+        running_flops = add_flops(model)
+        if isinstance(running_flops, torch.Tensor):
+            running_flops = running_flops.float().mean().cuda()
+        else:
+            running_flops = torch.FloatTensor([running_flops]).cuda()
+
+        loss = loss_fn(output, target)
+        prec1, prec5 = accuracy(output, target, topk=(1, 5))
+        if not args.distributed:
+            losses_m.update(loss.item(), input.size(0))
+            prec1_m.update(prec1.item(), input.size(0))
+            prec5_m.update(prec5.item(), input.size(0))
+            flops_m.update(running_flops.item(), input.size(0))
+        else:
+            reduced_loss = reduce_tensor(loss.data, args.world_size)
+            reduced_prec1 = reduce_tensor(prec1, args.world_size)
+            reduced_prec5 = reduce_tensor(prec5, args.world_size)
+            reduced_flops = reduce_tensor(running_flops, args.world_size)
+            torch.cuda.synchronize()
+            losses_m.update(reduced_loss.item(), input.size(0))
+            prec1_m.update(reduced_prec1.item(), input.size(0))
+            prec5_m.update(reduced_prec5.item(), input.size(0))
+            flops_m.update(reduced_flops.item(), input.size(0))
+        batch_time_m.update(time.time() - end)
+        if (last_batch or batch_idx % args.log_interval == 0) and args.local_rank == 0 and batch_idx != 0:
+            print_gate_stats(model)
+            log_name = 'Test' + log_suffix
+            logging.info(
+                '{}: [{:>4d}/{} ({:>3.0f}%)]  '
+                'Loss: {loss.val:>7.4f} ({loss.avg:>6.4f})  '
+                'Acc@1: {prec1.val:>9.6f} ({prec1.avg:>6.4f})  '
+                'Acc@5: {prec5.val:>9.6f} ({prec5.avg:>6.4f})  '
+                'GateAcc: {acc_gate[0].val:>6.4f}({acc_gate[0].avg:>6.4f})  '
+                'Flops: {flops.val:>6.0f} ({flops.avg:>6.0f})  '
+                'Time: {batch_time.val:.3f}s, {rate:>7.2f}/s  '
+                '({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s)  '
+                'DataTime: {data_time.val:.3f} ({data_time.avg:.3f})\n'.format(
+                    log_name,
+                    batch_idx, last_idx,
+                    100. * batch_idx / last_idx,
+                    loss=losses_m,
+                    prec1=prec1_m,
+                    prec5=prec5_m,
+                    flops=flops_m,
+                    batch_time=batch_time_m,
+                    rate=input.size(0) * args.world_size / batch_time_m.val,
+                    rate_avg=input.size(0) * args.world_size / batch_time_m.avg,
+                    data_time=data_time_m,
+                    acc_gate=acc_gate_m_l
+                )
+            )
+
+        end = time.time()
+        # end for
+    metrics = OrderedDict(
+        [('loss', losses_m.avg), ('prec1', prec1_m.avg), ('prec5', prec5_m.avg), ('flops', flops_m.avg),
+         ("time", round((time.time() - inference_begin), 4))])
+    print("average second per image: {}".format(round((time.time() - inference_begin)/len(loader), 4)))
+
+    return metrics
+
+
+def validate_slim(model, loader, loss_fn, args, log_suffix='', model_mode='largest'):
+    batch_time_m = AverageMeter()
+    losses_m = AverageMeter()
+    prec1_m = AverageMeter()
+    prec5_m = AverageMeter()
+    flops_m = AverageMeter()
+
+    model.eval()
+    model.apply(lambda m: add_mac_hooks(m))
+    end = time.time()
+    inference_begin = time.time()
+    last_idx = len(loader) - 1
+    with torch.no_grad():
+        for batch_idx, (input, target) in enumerate(loader):
+            if not isinstance(model_mode, str):
+                if hasattr(model, 'module'):
+                    model.module.set_mode('uniform', choice=model_mode)
+                else:
+                    model.set_mode('uniform', choice=model_mode)
+            else:
+                if hasattr(model, 'module'):
+                    model.module.set_mode(model_mode)
+                else:
+                    model.set_mode(model_mode)
+            last_batch = batch_idx == last_idx
+            if not args.prefetcher:
+                input = input.cuda()
+                target = target.cuda()
+
+            output = model(input)
+            running_flops = add_flops(model)
+            if isinstance(running_flops, torch.Tensor):
+                running_flops = running_flops.float().mean().cuda()
+            else:
+                running_flops = torch.FloatTensor([running_flops]).cuda()
+
+            # augmentation reduction
+            reduce_factor = args.tta
+            if reduce_factor > 1:
+                output = output.unfold(0, reduce_factor, reduce_factor).mean(dim=2)
+                target = target[0:target.size(0):reduce_factor]
+
+            loss = loss_fn(output, target)
+            prec1, prec5 = accuracy(output, target, topk=(1, 5))
+
+            if args.distributed:
+                reduced_loss = reduce_tensor(loss.data, args.world_size)
+                prec1 = reduce_tensor(prec1, args.world_size)
+                prec5 = reduce_tensor(prec5, args.world_size)
+                running_flops = reduce_tensor(running_flops, args.world_size)
+            else:
+                reduced_loss = loss.data
+
+            torch.cuda.synchronize()
+
+            losses_m.update(reduced_loss.item(), input.size(0))
+            prec1_m.update(prec1.item(), output.size(0))
+            prec5_m.update(prec5.item(), output.size(0))
+            flops_m.update(running_flops.item(), input.size(0))
+
+            batch_time_m.update(time.time() - end)
+            end = time.time()
+            if args.local_rank == 0 and last_batch:
+                if model_mode == 'dynamic':
+                    print_gate_stats(model)
+                log_name = 'Test' + log_suffix
+                logging.info(
+                    '{0}: [{1:>4d}/{2}]  '
+                    'Mode: {mode}   '
+                    'Time: {batch_time.val:.3f} ({batch_time.avg:.3f})  '
+                    'Loss: {loss.val:>7.4f} ({loss.avg:>6.4f})  '
+                    'Prec@1: {top1.val:>7.4f} ({top1.avg:>7.4f})  '
+                    'Prec@5: {top5.val:>7.4f} ({top5.avg:>7.4f})  '
+                    'Flops: {flops.val:>6.0f} ({flops.avg:>6.0f})'.format(
+                        log_name, batch_idx, last_idx,
+                        batch_time=batch_time_m,
+                        mode=model_mode,
+                        loss=losses_m,
+                        flops=flops_m,
+                        top1=prec1_m, top5=prec5_m))
+
+    metrics = OrderedDict(
+        [('loss', losses_m.avg), ('prec1', prec1_m.avg), ('prec5', prec5_m.avg), ('flops', flops_m.avg),
+         ("time", round((time.time() - inference_begin), 4))])
+
+    return metrics
+
 
 
 def main():
@@ -655,6 +846,7 @@ def main():
 
     if args.local_rank == 0:
         print('Test results of the last epoch:\n', eval_metrics)
+
 
 
 if __name__ == '__main__':
